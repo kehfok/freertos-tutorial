@@ -39,7 +39,7 @@ typedef struct
 // Settings
 static const uint16_t timer_div = 80; // prescaler
 static const uint64_t timer_max_count = 100000; // approximately .1s to achieve 10Hz
-static const uint8_t msg_len = 255; // message queue length
+static const uint8_t CMD_BUF_LEN = 255; // message queue length
 static const uint8_t BUF_LEN = 10; // # length of ISR fifo sample buffer
 static const char avg_cmd[] = "avg";
 
@@ -47,9 +47,9 @@ static const char avg_cmd[] = "avg";
 static const int adc_pin = A0; // adc0
 
 // Globals
-// static volatile circ_bbuf_t my_circ_buf;
 CIRC_BBUF_DEF(my_circ_buf, BUF_LEN); // circular buffer for storing samples from ADC
-static float avg = 0.;
+static uint8_t buf_idx = 0; // keeps track of the circular buffers idx
+static float avg = 0.; // stores the avg value of the last 10 samples
 static hw_timer_t* timer = NULL; // hw timer to sample from ADC at 10hz
 static TaskHandle_t taskHandleCalculateAverage = NULL; // process task handle for calculating average
 
@@ -88,7 +88,7 @@ int circ_bbuf_pop(volatile circ_bbuf_t* buf, uint32_t* data)
 // Sample from adc and add to buffer
 void IRAM_ATTR onTimer()
 {
-    static uint16_t buf_idx = 0; // idx to keep track of current buffer fill
+    // buf_idx = 0; // idx to keep track of current buffer fill
     BaseType_t task_woken = pdFALSE; // Keeps track of the task status
 
     // Only read adc and push to buffer if under the buffer length
@@ -120,6 +120,7 @@ void IRAM_ATTR onTimer()
 
 // Tasks
 // Wait for semaphore (from ISR) and calculate average of values from buffer
+// Task reads 10 values from the circular buffer before updating index
 void taskCalculateAverage(void* parameters)
 {
     while (1)
@@ -142,58 +143,52 @@ void taskCalculateAverage(void* parameters)
         // TODO: see if we need to protect the buff idx
         buf_idx = 0;
     }
-
-
 }
 
 void taskCLI(void* parameters)
 {
     uint8_t cmd_len = strlen(avg_cmd);
     char c;
-    char buf[msg_len];
-    uint8_t buf_idx = 0;
-    memset(buf, 0, msg_len);
+    char cmd_buf[CMD_BUF_LEN];
+    uint8_t idx = 0;
+    memset(cmd_buf, 0, CMD_BUF_LEN); // Initially zero out the command buffer
 
     while (1)
     {
         // Echo user input and check if they've entered the avg command
         if (Serial.available() > 0)
         {
-            // enable led and echo character back
             c = Serial.read();
             Serial.print(c);
 
             // Add character input to buffer if space is available
-            if (buf_idx < msg_len - 1)
+            if (idx < CMD_BUF_LEN - 1)
             {
-                buf[buf_idx] = c;
-                buf_idx++;
+                cmd_buf[idx] = c;
+                idx++;
             }
 
-            // Check for avg command from user
-            if (c == '\n' || c == '\0')
+            // Check for avg command from user on newline (return)
+            if (c == '\n' || c == '\r')
             {
-                // Match is found
-                if (memcmp(buf, avg_cmd, cmd_len) == 0)
+                // User has entered avg command
+                if (memcmp(cmd_buf, avg_cmd, cmd_len) == 0)
                 {
-                    // TODO: perform avg related operations
                     char out[50];
                     sprintf(out, "Average: %.2f", avg);
                     Serial.println(avg);
                 }
 
                 // Clear buffer after user sends newline
-                memset(buf, 0, msg_len);
-                buf_idx = 0;
+                memset(cmd_buf, 0, CMD_BUF_LEN);
+                idx = 0;
             }
         }
-    }
-    
+    }    
 }
 
 void setup()
 {
-    // put your setup code here, to run once:
     // Configure serial
     Serial.begin(115200);
 
@@ -210,13 +205,16 @@ void setup()
     timerAttachInterrupt(timer, &onTimer, true);
 
     // Configure timer count that should trigger ISR
-    // 1000000 = 1 second delay -- 10Hz = 1/10 = .1s
+    // 1000000 = 1 second delay -- 10Hz = 1/10 = .1s (100ms)
     timerAlarmWrite(timer, timer_max_count, true/*auto-reload*/);
 
     timerAlarmEnable(timer);
 
-    // Create task
-    xTaskCreatePinnedToCore(taskCLI, "taskClI", 2048, NULL, 1, NULL, app_cpu);
+    // Create tasks
+    // Create CLI task with higher priority
+    xTaskCreatePinnedToCore(taskCLI, "taskClI", 2048, NULL, 2, NULL, app_cpu);
+    // Create average task with lower priority
+    xTaskCreatePinnedToCore(taskCalculateAverage, "taskClI", 2048, NULL, 1, &taskHandleCalculateAverage, app_cpu);
 
     // Delete the setup and loop task
     vTaskDelete(NULL);
